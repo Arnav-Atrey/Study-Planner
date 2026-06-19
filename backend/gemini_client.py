@@ -48,7 +48,8 @@ class GeminiClient:
     def __init__(self):
         try:
             genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
-            self.model = genai.GenerativeModel('gemini-flash-latest')
+            # Use gemini-2.0-flash (recommended) or gemini-1.5-pro as fallback
+            self.model = genai.GenerativeModel('gemini-1.5-flash')
         except Exception as e:
             print(f"Error configuring Gemini API: {e}")
             self.model = None

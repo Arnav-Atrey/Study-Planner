@@ -1,19 +1,21 @@
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 load_dotenv()
 
-from auth import create_access_token, get_current_user
+from auth import create_access_token, get_current_user, get_user_from_token
 from database import close_db, init_db
 from gemini_client import GeminiClient
 from models import ChatMessage, Conversation, User, validate_password_strength
+from voice_agent import VoiceSession
 
 gemini_client = GeminiClient()
 
@@ -216,6 +218,156 @@ async def chat(payload: ChatRequest, current_user: User = Depends(get_current_us
         return {"response": response_text, "conversation_id": conv_id}
     except Exception:
         raise HTTPException(status_code=500, detail="Error generating response")
+
+
+# ---- Voice (Gemini Live) ----
+
+
+@app.websocket("/ws/voice")
+async def voice_ws(
+    websocket: WebSocket,
+    token: str = Query(...),
+    conversation_id: Optional[str] = Query(None),
+):
+    """Real-time voice assistant over WebSocket.
+
+    Client -> server binary frames: raw 16kHz PCM16 mic audio.
+    Client -> server text frame "stop": end the session cleanly.
+
+    Server -> client binary frames: raw 24kHz PCM16 audio to play back.
+    Server -> client JSON frames: {"type": "input_transcript"|"output_transcript"
+        |"turn_complete"|"interrupted"|"error"|"ready", ...}
+    """
+    user = await get_user_from_token(token)
+    if user is None:
+        await websocket.close(code=4401, reason="Unauthorized")
+        return
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        await websocket.close(code=1011, reason="Voice service not configured")
+        return
+
+    await websocket.accept()
+
+    conv: Optional[Conversation] = None
+    if conversation_id:
+        conv = await Conversation.get(conversation_id)
+        if not conv or conv.user_id != str(user.id):
+            conv = None
+    if conv is None:
+        conv = Conversation(user_id=str(user.id), title="Voice chat")
+        await conv.insert()
+    conv_id = str(conv.id)
+
+    await websocket.send_json({"type": "ready", "conversation_id": conv_id})
+
+    session = VoiceSession(api_key=api_key)
+
+    # Buffers for the transcript text of the turn currently in progress.
+    # Gemini streams transcription incrementally; we accumulate and only
+    # persist to Mongo once a turn completes.
+    input_buffer = {"text": ""}
+    output_buffer = {"text": ""}
+
+    async def persist_turn() -> None:
+        user_text = input_buffer["text"].strip()
+        assistant_text = output_buffer["text"].strip()
+        input_buffer["text"] = ""
+        output_buffer["text"] = ""
+
+        if not user_text and not assistant_text:
+            return
+
+        if user_text:
+            await ChatMessage(
+                user_id=str(user.id),
+                conversation_id=conv_id,
+                role="user",
+                content=user_text,
+            ).insert()
+        if assistant_text:
+            await ChatMessage(
+                user_id=str(user.id),
+                conversation_id=conv_id,
+                role="assistant",
+                content=assistant_text,
+            ).insert()
+
+        if conv.title in ("New chat", "Voice chat") and user_text:
+            conv.title = (user_text[:50] + "…") if len(user_text) > 50 else user_text
+        conv.updated_at = datetime.utcnow()
+        await conv.save()
+
+    async def on_audio_chunk(chunk: bytes) -> None:
+        await websocket.send_bytes(chunk)
+
+    async def on_input_transcript(text: str) -> None:
+        input_buffer["text"] += text
+        await websocket.send_json({"type": "input_transcript", "text": text})
+
+    async def on_output_transcript(text: str) -> None:
+        output_buffer["text"] += text
+        await websocket.send_json({"type": "output_transcript", "text": text})
+
+    async def on_turn_complete() -> None:
+        await websocket.send_json({"type": "turn_complete"})
+        await persist_turn()
+
+    async def on_interrupted() -> None:
+        await websocket.send_json({"type": "interrupted"})
+
+    async def receive_loop() -> None:
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                session.stop()
+                return
+            if "bytes" in message and message["bytes"] is not None:
+                session.push_audio(message["bytes"])
+            elif "text" in message and message["text"] is not None:
+                if message["text"] == "stop":
+                    session.stop()
+                    return
+
+    try:
+        recv_task_handle = asyncio.create_task(receive_loop())
+        run_task_handle = asyncio.create_task(
+            session.run(
+                on_audio_chunk=on_audio_chunk,
+                on_input_transcript=on_input_transcript,
+                on_output_transcript=on_output_transcript,
+                on_turn_complete=on_turn_complete,
+                on_interrupted=on_interrupted,
+            )
+        )
+
+        done, pending = await asyncio.wait(
+            {recv_task_handle, run_task_handle},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        session.stop()
+        for task in pending:
+            task.cancel()
+        for task in done:
+            if not task.cancelled() and task.exception():
+                raise task.exception()
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+
+        traceback.print_exc()
+        try:
+            await websocket.send_json({"type": "error", "message": str(exc)})
+        except Exception:
+            pass
+    finally:
+        await persist_turn()
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

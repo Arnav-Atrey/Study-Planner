@@ -4,6 +4,7 @@ import { api } from '../api/client';
 import LoadingIndicator from '../components/LoadingIndicator';
 import MessageBubble from '../components/MessageBubble';
 import { useAuth } from '../context/AuthContext';
+import { useVoiceAgent } from '../voice/useVoiceAgent';
 
 const WELCOME_MESSAGE =
   "Hello! I'm your AI Study Planner. What topic would you like to study today?";
@@ -17,6 +18,11 @@ export default function Chat() {
   const [sending, setSending] = useState(false);
   const [initializing, setInitializing] = useState(true);
   const chatEndRef = useRef(null);
+  const currentConversationIdRef = useRef(null);
+
+  useEffect(() => {
+    currentConversationIdRef.current = currentConversationId;
+  }, [currentConversationId]);
 
   const scrollToBottom = useCallback(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -46,6 +52,37 @@ export default function Chat() {
     [loadConversations, loadHistory],
   );
 
+  // Called once a voice turn finishes: append both sides of the exchange as
+  // chat bubbles, same shape as a text turn. The backend has already
+  // persisted these to Mongo by the time turn_complete fires.
+  const handleVoiceTurn = useCallback(({ user: userText, assistant: assistantText }) => {
+    setMessages((prev) => {
+      const next = [...prev];
+      if (userText) next.push({ role: 'user', content: userText });
+      if (assistantText) next.push({ role: 'assistant', content: assistantText });
+      return next;
+    });
+  }, []);
+
+  // The voice WebSocket creates a conversation server-side if none was
+  // passed; this syncs that back into local state/sidebar.
+  const handleVoiceConversationId = useCallback(
+    (id) => {
+      if (!id) return;
+      if (id !== currentConversationIdRef.current) {
+        setCurrentConversationId(id);
+      }
+      loadConversations().then(setConversations);
+    },
+    [loadConversations],
+  );
+
+  const voice = useVoiceAgent({
+    conversationId: currentConversationId,
+    onTurn: handleVoiceTurn,
+    onConversationId: handleVoiceConversationId,
+  });
+
   useEffect(() => {
     if (!user) return;
 
@@ -73,7 +110,7 @@ export default function Chat() {
 
   useEffect(() => {
     scrollToBottom();
-  }, [messages, sending, scrollToBottom]);
+  }, [messages, sending, voice.liveUserText, voice.liveAssistantText, scrollToBottom]);
 
   if (loading) {
     return (
@@ -88,6 +125,7 @@ export default function Chat() {
   }
 
   async function handleNewChat() {
+    if (voice.listening || voice.connecting) voice.stop();
     const conv = await api.createConversation('New chat');
     const convos = await loadConversations();
     setConversations(convos);
@@ -126,7 +164,16 @@ export default function Chat() {
     }
   }
 
-  const showWelcome = messages.length === 0;
+  function handleMicToggle() {
+    if (voice.listening || voice.connecting) {
+      voice.stop();
+    } else {
+      voice.start();
+    }
+  }
+
+  const showWelcome = messages.length === 0 && !voice.liveUserText && !voice.liveAssistantText;
+  const micActive = voice.listening || voice.connecting;
 
   return (
     <div className="flex h-screen bg-gray-100">
@@ -182,21 +229,56 @@ export default function Chat() {
               {messages.map((m, i) => (
                 <MessageBubble key={`${m.role}-${i}`} role={m.role} content={m.content} />
               ))}
+              {voice.liveUserText && (
+                <MessageBubble role="user" content={voice.liveUserText} />
+              )}
+              {voice.liveAssistantText && (
+                <MessageBubble role="assistant" content={voice.liveAssistantText} />
+              )}
               {sending && <LoadingIndicator />}
               <div ref={chatEndRef} />
             </div>
           )}
         </main>
 
+        {voice.error && (
+          <div className="mx-auto w-full max-w-3xl px-4">
+            <p className="mb-2 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-600">
+              {voice.error}
+            </p>
+          </div>
+        )}
+
         <footer className="bg-white p-4">
           <div className="mx-auto flex max-w-3xl items-center">
+            <button
+              type="button"
+              onClick={handleMicToggle}
+              disabled={sending || initializing}
+              title={micActive ? 'Stop listening' : 'Start voice chat'}
+              className={`mr-3 flex h-12 w-12 shrink-0 items-center justify-center rounded-full text-white transition-colors disabled:opacity-60 ${
+                micActive
+                  ? 'animate-pulse bg-red-500 hover:bg-red-600'
+                  : 'bg-gray-400 hover:bg-gray-500'
+              }`}
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 24 24"
+                fill="currentColor"
+                className="h-6 w-6"
+              >
+                <path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Z" />
+                <path d="M19 11a1 1 0 1 0-2 0 5 5 0 0 1-10 0 1 1 0 1 0-2 0 7 7 0 0 0 6 6.92V20H9a1 1 0 1 0 0 2h6a1 1 0 1 0 0-2h-2v-2.08A7 7 0 0 0 19 11Z" />
+              </svg>
+            </button>
             <input
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
               disabled={sending || initializing}
-              placeholder="Type your message..."
+              placeholder={micActive ? 'Listening…' : 'Type your message...'}
               className="flex-1 rounded-full border-2 border-gray-300 p-3 focus:border-blue-500 focus:outline-none disabled:opacity-60"
             />
             <button

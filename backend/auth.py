@@ -21,6 +21,24 @@ def create_access_token(user_id: str) -> str:
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 
+async def get_user_from_token(token: str) -> Optional[User]:
+    """Decode a raw JWT string and look up the user. Returns None on any failure.
+
+    Used by the voice WebSocket route, where the token arrives as a query
+    param instead of an Authorization header, so the usual HTTPBearer
+    dependency doesn't apply.
+    """
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str | None = payload.get("sub")
+        if user_id is None:
+            return None
+    except JWTError:
+        return None
+
+    return await User.get(user_id)
+
+
 async def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> User:
